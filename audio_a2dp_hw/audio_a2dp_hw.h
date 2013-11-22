@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (c) 2013, Linux Foundation. All rights reserved.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -54,6 +55,7 @@
 typedef enum {
     A2DP_CTRL_CMD_NONE,
     A2DP_CTRL_CMD_CHECK_READY,
+    A2DP_CTRL_CMD_CHECK_STREAM_STARTED,
     A2DP_CTRL_CMD_START,
     A2DP_CTRL_CMD_STOP,
     A2DP_CTRL_CMD_SUSPEND
@@ -61,7 +63,8 @@ typedef enum {
 
 typedef enum {
     A2DP_CTRL_ACK_SUCCESS,
-    A2DP_CTRL_ACK_FAILURE
+    A2DP_CTRL_ACK_FAILURE,
+    A2DP_CTRL_ACK_INCALL_FAILURE /* Failure when in Call*/
 } tA2DP_CTRL_ACK;
 
 

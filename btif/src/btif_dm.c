@@ -1,5 +1,7 @@
 /******************************************************************************
  *
+ *  Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ *  Not a Contribution.
  *  Copyright (C) 2009-2012 Broadcom Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +61,7 @@
 #define COD_AV_PORTABLE_AUDIO               0x041C
 #define COD_AV_HIFI_AUDIO                   0x0428
 
+#define HID_UUID            "00001124-0000-1000-8000-00805f9b34fb"
 
 #define BTIF_DM_DEFAULT_INQ_MAX_RESULTS     0
 #define BTIF_DM_DEFAULT_INQ_MAX_DURATION    10
@@ -156,8 +159,13 @@ extern UINT16 bta_service_id_to_uuid_lkup_tbl [BTA_MAX_SERVICE_ID];
 extern bt_status_t btif_hf_execute_service(BOOLEAN b_enable);
 extern bt_status_t btif_av_execute_service(BOOLEAN b_enable);
 extern bt_status_t btif_hh_execute_service(BOOLEAN b_enable);
+extern bt_status_t btif_mce_execute_service(BOOLEAN b_enable);
+extern bt_status_t btif_hf_client_execute_service(BOOLEAN b_enable);
 extern int btif_hh_connect(bt_bdaddr_t *bd_addr);
+extern BOOLEAN btif_hh_check_if_conn_in_prog(void);
 extern void bta_gatt_convert_uuid16_to_uuid128(UINT8 uuid_128[LEN_UUID_128], UINT16 uuid_16);
+extern BOOLEAN btif_av_is_connected();
+extern void btif_av_close_update();
 
 
 /******************************************************************************
@@ -183,7 +191,14 @@ bt_status_t btif_in_execute_service_request(tBTA_SERVICE_ID service_id,
          {
               btif_hh_execute_service(b_enable);
          }break;
-
+         case BTA_MAP_SERVICE_ID:
+         {
+             btif_mce_execute_service(b_enable);
+         }break;
+         case BTA_HFP_HS_SERVICE_ID:
+         {
+             btif_hf_client_execute_service(b_enable);
+         }break;
          default:
               BTIF_TRACE_ERROR1("%s: Unknown service being enabled", __FUNCTION__);
               return BT_STATUS_FAIL;
@@ -447,7 +462,7 @@ static void btif_update_remote_properties(BD_ADDR bd_addr, BD_NAME bd_name,
 ** Returns          void
 **
 *******************************************************************************/
-static void hid_remote_name_cback(void *p_param)
+static void hid_remote_name_cback(tBTM_REMOTE_DEV_NAME *p_param)
 {
     BTIF_TRACE_DEBUG1("%s", __FUNCTION__);
 
@@ -476,11 +491,62 @@ static void btif_dm_cb_hid_remote_name(tBTM_REMOTE_DEV_NAME *p_remote_name)
 
         if (p_remote_name->status == BTM_SUCCESS)
         {
-            bond_state_changed(BT_STATUS_SUCCESS, &remote_bd, BT_BOND_STATE_BONDED);
+            int status;
+            BTIF_TRACE_DEBUG2("%s: name of device =%s ", __FUNCTION__, p_remote_name->remote_bd_name);
+            int num_properties = 0;
+            bt_property_t properties[1];
+
+            /* remote name */
+            if (strlen((const char *) p_remote_name->remote_bd_name))
+            {
+                BTIF_STORAGE_FILL_PROPERTY(&properties[num_properties],
+                                    BT_PROPERTY_BDNAME,
+                                    strlen((char *)p_remote_name->remote_bd_name),
+                                    p_remote_name->remote_bd_name);
+                status = btif_storage_set_remote_device_property(&remote_bd, &properties[num_properties]);
+                ASSERTC(status == BT_STATUS_SUCCESS, "failed to save remote device name", status);
+                num_properties++;
+                HAL_CBACK(bt_hal_cbacks, remote_device_properties_cb,
+                                 status, &remote_bd, num_properties, properties);
+            }
+
+            /* Trigger SDP on the device */
+            pairing_cb.sdp_attempts = 1;
+            btif_dm_get_remote_services(&remote_bd);
+            /* Store Device as bonded in nvram */
+            btif_storage_add_bonded_device(&remote_bd, NULL, 0, 0);
         }
         else
             bond_state_changed(BT_STATUS_FAIL, &remote_bd, BT_BOND_STATE_NONE);
     }
+}
+
+/*******************************************************************************
+**
+** Function         btif_dm_cb_cancel_hid_bond
+**
+** Description      Cancels pending Bonding with HID Device. Called in btif context
+**                  Special handling for HID devices
+**
+** Returns          void
+**
+*******************************************************************************/
+static void btif_dm_cb_cancel_hid_bond(bt_bdaddr_t *p_bdaddr)
+{
+    BTIF_TRACE_DEBUG2("%s: pairing_cb.state=%d", __FUNCTION__, pairing_cb.state);
+    if (pairing_cb.state == BT_BOND_STATE_BONDING)
+        bond_state_changed(BT_STATUS_RMT_DEV_DOWN, p_bdaddr, BT_BOND_STATE_NONE);
+}
+
+int remove_hid_bond(bt_bdaddr_t *bd_addr)
+{
+    /* For HID device, inorder to avoid the HID device from re-connecting again after unpairing,
+         * we need to do virtual unplug
+         */
+    bdstr_t bdstr;
+    BTIF_TRACE_DEBUG2("%s---Removing HID bond--%s", __FUNCTION__,bd2str((bt_bdaddr_t *)bd_addr, &bdstr));
+    return btif_hh_virtual_unplug(bd_addr);
+
 }
 
 /*******************************************************************************
@@ -501,11 +567,27 @@ static void btif_dm_cb_create_bond(bt_bdaddr_t *bd_addr)
     bond_state_changed(BT_STATUS_SUCCESS, bd_addr, BT_BOND_STATE_BONDING);
 
     if (is_hid){
+            tBTA_DM_SEARCH p_search_data;
+            bt_bdname_t bdname;
+            bt_bdaddr_t bdaddr;
+            UINT8 remote_name_len = 0;
 
-            int status;
-            status = btif_hh_connect(bd_addr);
-            if(status != BT_STATUS_SUCCESS)
-                bond_state_changed(status, bd_addr, BT_BOND_STATE_NONE);
+            bdcpy(p_search_data.inq_res.bd_addr,  bd_addr->address);
+            bdname.name[0] = 0;
+            check_cached_remote_name(&p_search_data, bdname.name, &remote_name_len);
+            if (remote_name_len != 0)
+            {
+                /* Remote Name of device known, Trigger SDP on the device */
+                pairing_cb.sdp_attempts = 1;
+                btif_dm_get_remote_services(bd_addr);
+                /* Store Device as bonded in nvram */
+                btif_storage_add_bonded_device(bd_addr, NULL, 0, 0);
+            }
+            else
+            {
+                /* Remote Name of device unknown, Perform RnR */
+                BTA_DmRemName(p_search_data.inq_res.bd_addr, hid_remote_name_cback);
+            }
     }
     else
     {
@@ -647,6 +729,7 @@ static void btif_dm_pin_req_evt(tBTA_DM_PIN_REQ *p_pin_req)
     bt_bdname_t bd_name;
     UINT32 cod;
     bt_pin_code_t pin_code;
+    BOOLEAN secure;
 
     /* Remote properties update */
     btif_update_remote_properties(p_pin_req->bd_addr, p_pin_req->bd_name,
@@ -658,6 +741,8 @@ static void btif_dm_pin_req_evt(tBTA_DM_PIN_REQ *p_pin_req)
     bond_state_changed(BT_STATUS_SUCCESS, &bd_addr, BT_BOND_STATE_BONDING);
 
     cod = devclass2uint(p_pin_req->dev_class);
+
+    secure = p_pin_req->secure;
 
     if ( cod == 0) {
         BTIF_TRACE_DEBUG1("%s():cod is 0, set as unclassified", __FUNCTION__);
@@ -709,7 +794,7 @@ static void btif_dm_pin_req_evt(tBTA_DM_PIN_REQ *p_pin_req)
         }
     }
     HAL_CBACK(bt_hal_cbacks, pin_request_cb,
-                     &bd_addr, &bd_name, cod);
+                     &bd_addr, &bd_name, cod, secure);
 }
 
 /*******************************************************************************
@@ -860,8 +945,22 @@ static void btif_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
         if(btif_dm_inquiry_in_progress)
             btif_dm_cancel_discovery();
 
-        btif_dm_get_remote_services(&bd_addr);
-        /* Do not call bond_state_changed_cb yet. Wait till fetch remote service is complete */
+        /* Special Handling for HID Devices */
+        BOOLEAN is_hid = check_cod(&bd_addr, COD_HID_POINTING);
+        if (is_hid && btif_hh_check_if_conn_in_prog())
+        {
+            /* For HID Pointing devices, in case of outgoing connection,
+             * SDP has been performed already before initiating HID connection,
+             * so now just inform upper layers that authentication is successful.*/
+            BTIF_TRACE_DEBUG1("%s: sending BT_BOND_STATE_BONDED for hid device",
+                    __FUNCTION__);
+            bond_state_changed(BT_STATUS_SUCCESS, &bd_addr, BT_BOND_STATE_BONDED);
+        }
+        else
+        {
+            /* Do not call bond_state_changed_cb yet. Wait till fetch remote service is complete */
+            btif_dm_get_remote_services(&bd_addr);
+        }
     }
     else
     {
@@ -873,6 +972,10 @@ static void btif_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
                 status =  BT_STATUS_RMT_DEV_DOWN;
                 break;
 
+            case HCI_ERR_PAIRING_NOT_ALLOWED:
+                status = BT_STATUS_AUTH_REJECTED;
+                break;
+
             /* map the auth failure codes, so we can retry pairing if necessary */
             case HCI_ERR_AUTH_FAILURE:
             case HCI_ERR_HOST_REJECT_SECURITY:
@@ -880,6 +983,8 @@ static void btif_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
             case HCI_ERR_UNIT_KEY_USED:
             case HCI_ERR_PAIRING_WITH_UNIT_KEY_NOT_SUPPORTED:
             case HCI_ERR_INSUFFCIENT_SECURITY:
+            case HCI_ERR_PEER_USER:
+            case HCI_ERR_UNSPECIFIED:
                 BTIF_TRACE_DEBUG1(" %s() Authentication fail ", __FUNCTION__);
                 if (pairing_cb.autopair_attempts  == 1)
                 {
@@ -1105,6 +1210,7 @@ static void btif_dm_search_services_evt(UINT16 event, char *p_param)
             uint32_t i = 0,  j = 0;
             bt_bdaddr_t bd_addr;
             bt_status_t ret;
+            BOOLEAN hid_uuid_present = FALSE;
 
             bdcpy(bd_addr.address, p_data->disc_res.bd_addr);
 
@@ -1129,6 +1235,8 @@ static void btif_dm_search_services_evt(UINT16 event, char *p_param)
                  {
                       char temp[256];
                       uuid_to_string((bt_uuid_t*)(p_data->disc_res.p_uuid_list + (i*MAX_UUID_SIZE)), temp);
+                      if (strcmp(temp, HID_UUID) == 0)
+                          hid_uuid_present = TRUE;
                       BTIF_TRACE_ERROR2("Index: %d uuid:%s", i, temp);
                  }
             }
@@ -1144,6 +1252,19 @@ static void btif_dm_search_services_evt(UINT16 event, char *p_param)
                                    __FUNCTION__);
                  pairing_cb.sdp_attempts  = 0;
                  bond_state_changed(BT_STATUS_SUCCESS, &bd_addr, BT_BOND_STATE_BONDED);
+
+                 /*special handling for HID devices */
+                 BOOLEAN is_hid = check_cod(&bd_addr, COD_HID_POINTING);
+                 if (is_hid)
+                 {
+                     /* Initiate HID connection for Pointing Devices */
+                     btif_hh_connect(&bd_addr);
+                 }
+                 if (check_cod_hid(&bd_addr, COD_HID_MAJOR) || hid_uuid_present)
+                 {
+                     /* Inform HID layer that SDP is complete */
+                     btif_hh_sdp_cmpl_after_bonding(bd_addr);
+                 }
             }
 
             if(p_data->disc_res.num_uuids != 0)
@@ -1429,7 +1550,15 @@ static void btif_dm_upstreams_evt(UINT16 event, char* p_param)
             BTIF_TRACE_ERROR0("Received H/W Error. ");
             /* Flush storage data */
             btif_config_flush();
+            //checking weather music is palyed or not
+            if (btif_av_is_connected())
+            {
+                BTIF_TRACE_DEBUG0("Stream is Active disconnect before kill");
+                btif_av_close_update();
+            }
+            BTIF_TRACE_DEBUG0("going to sleep ");
             usleep(100000); /* 100milliseconds */
+            BTIF_TRACE_DEBUG0("sleep over !! ");
             /* Killing the process to force a restart as part of fault tolerance */
             kill(getpid(), SIGKILL);
             break;
@@ -1631,6 +1760,12 @@ static void btif_dm_generic_evt(UINT16 event, char* p_param)
         }
         break;
 
+        case BTIF_DM_CB_CANCEL_HID_BOND:
+        {
+            btif_dm_cb_cancel_hid_bond((bt_bdaddr_t *)p_param);
+        }
+        break;
+
         case BTIF_DM_CB_BOND_STATE_BONDING:
             {
                 bond_state_changed(BT_STATUS_SUCCESS, (bt_bdaddr_t *)p_param, BT_BOND_STATE_BONDING);
@@ -1793,7 +1928,11 @@ bt_status_t btif_dm_start_discovery(void)
     tBTA_DM_INQ inq_params;
     tBTA_SERVICE_MASK services = 0;
 
-    BTIF_TRACE_EVENT1("%s", __FUNCTION__);
+    BTIF_TRACE_EVENT2("%s : pairing_cb.state: 0x%x", __FUNCTION__, pairing_cb.state);
+
+    /* We should not go for inquiry in BONDING STATE. */
+    if (pairing_cb.state == BT_BOND_STATE_BONDING)
+        return BT_STATUS_BUSY;
     /* TODO: Do we need to handle multiple inquiries at the same time? */
 
     /* Set inquiry params and call API */
@@ -1895,7 +2034,11 @@ bt_status_t btif_dm_cancel_bond(const bt_bdaddr_t *bd_addr)
                 BTA_DmBleSecurityGrant((UINT8 *)bd_addr->address,BTA_DM_SEC_PAIR_NOT_SPT);
             }
             else
+            {
                 BTA_DmConfirm( (UINT8 *)bd_addr->address, FALSE);
+                BTA_DmBondCancel ((UINT8 *)bd_addr->address);
+                btif_storage_remove_bonded_device((bt_bdaddr_t *)bd_addr);
+            }
         }
         else
         {
@@ -1945,6 +2088,29 @@ bt_status_t btif_dm_remove_bond(const bt_bdaddr_t *bd_addr)
 
     BTIF_TRACE_EVENT2("%s: bd_addr=%s", __FUNCTION__, bd2str((bt_bdaddr_t *)bd_addr, &bdstr));
     btif_transfer_context(btif_dm_generic_evt, BTIF_DM_CB_REMOVE_BOND,
+                          (char *)bd_addr, sizeof(bt_bdaddr_t), NULL);
+
+    return BT_STATUS_SUCCESS;
+}
+
+/*******************************************************************************
+**
+** Function         btif_dm_cancel_hid_bond
+**
+** Description      Cancels bonding to HID device if in progress
+**
+** Returns          bt_status_t
+**
+*******************************************************************************/
+bt_status_t btif_dm_cancel_hid_bond(const bt_bdaddr_t *bd_addr)
+{
+    bdstr_t bdstr;
+
+    BTIF_TRACE_EVENT2("%s: bd_addr=%s", __FUNCTION__, bd2str((bt_bdaddr_t *) bd_addr, &bdstr));
+    if (pairing_cb.state != BT_BOND_STATE_BONDING)
+        return BT_STATUS_DONE;
+
+    btif_transfer_context(btif_dm_generic_evt, BTIF_DM_CB_CANCEL_HID_BOND,
                           (char *)bd_addr, sizeof(bt_bdaddr_t), NULL);
 
     return BT_STATUS_SUCCESS;
@@ -2063,9 +2229,18 @@ bt_status_t btif_dm_get_adapter_property(bt_property_t *prop)
 
         case BT_PROPERTY_ADAPTER_SCAN_MODE:
         {
-            /* if the storage does not have it. Most likely app never set it. Default is NONE */
+            /* get scan mode state from storage */
             bt_scan_mode_t *mode = (bt_scan_mode_t*)prop->val;
-            *mode = BT_SCAN_MODE_NONE;
+            switch (*mode)
+            {
+                case BT_SCAN_MODE_NONE:
+                case BT_SCAN_MODE_CONNECTABLE:
+                case BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE:
+                break;
+
+                default:
+                    *mode = BT_SCAN_MODE_NONE;
+            }
             prop->len = sizeof(bt_scan_mode_t);
         }
         break;
@@ -2534,7 +2709,7 @@ static void btif_dm_ble_passkey_req_evt(tBTA_DM_PIN_REQ *p_pin_req)
     cod = COD_UNCLASSIFIED;
 
     HAL_CBACK(bt_hal_cbacks, pin_request_cb,
-              &bd_addr, &bd_name, cod);
+              &bd_addr, &bd_name, cod, FALSE);
 }
 
 
